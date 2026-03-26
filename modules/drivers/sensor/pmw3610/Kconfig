@@ -1,0 +1,65 @@
+menuconfig PMW3610
+	bool "PMW3610 mouse optical sensor"
+	default n
+	depends on GPIO
+	depends on INPUT
+	help
+	  Enable driver for the PixArt PMW3610 optical motion sensor.
+	  Uses GPIO bit-bang 3-wire SPI for the bidirectional SDIO line.
+
+if PMW3610
+
+config PMW3610_SWAP_XY
+	bool "Swap the X/Y axes"
+
+config PMW3610_INVERT_X
+	bool "Invert the X axis"
+
+config PMW3610_INVERT_Y
+	bool "Invert the Y axis"
+
+config PMW3610_REPORT_INTERVAL_MIN
+	int "Minimum report interval (ms)"
+	default 12
+	help
+	  Rate-limit motion reports for BLE stability.
+	  Set to 0 for maximum responsiveness (USB).
+	  12 ms works well for BLE split keyboards.
+
+config PMW3610_SMART_ALGORITHM
+	bool "Enable surface coverage enhancement algorithm"
+	default n
+	help
+	  Extends tracking across a wider range of surfaces
+	  (granites, tiles) at the cost of slightly more power.
+
+config PMW3610_RUN_DOWNSHIFT_TIME_MS
+	int "RUN → REST1 downshift time (ms)"
+	default 128
+	range 32 8160
+
+config PMW3610_REST1_DOWNSHIFT_TIME_MS
+	int "REST1 → REST2 downshift time (ms)"
+	default 5000
+
+config PMW3610_REST2_DOWNSHIFT_TIME_MS
+	int "REST2 → REST3 downshift time (ms)"
+	default 17000
+
+config PMW3610_REST1_SAMPLE_TIME_MS
+	int "REST1 sample period (ms)"
+	default 40
+
+config PMW3610_REST2_SAMPLE_TIME_MS
+	int "REST2 sample period (ms)"
+	default 100
+
+config PMW3610_REST3_SAMPLE_TIME_MS
+	int "REST3 sample period (ms)"
+	default 500
+
+module = PMW3610
+module-str = PMW3610
+source "${ZEPHYR_BASE}/subsys/logging/Kconfig.template.log_config"
+
+endif # PMW3610
