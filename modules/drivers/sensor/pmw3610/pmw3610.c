@@ -19,6 +19,7 @@
 #include <zephyr/input/input.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/logging/log.h>
+#include <stdlib.h>
 
 #include <zmk/events/activity_state_changed.h>
 

@@ -1,2 +1,1 @@
-zephyr_library()
-zephyr_library_sources(pmw3610.c)
+target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/pmw3610.c)
