@@ -27,39 +27,22 @@
 
 LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
 
-/* ── Acceleration lookup tables (from little-wing) ─────────────────── *
+/* ── Acceleration ──────────────────────────────────────────────────── *
  *
- * Pre-computed power curves for integer deltas 0..49.
- * pow13[d] ≈ d^1.3 × 256 (used as default)
- * pow15[d] ≈ d^1.5 × 256
- * pow20[d] ≈ d^2.0 × 256
+ * Pre-computed LUT mapping input delta -> output delta (8.8 fixed-point).
+ * Rebuilt whenever acceleration parameters change.
  *
- * For deltas ≥ 50 a linear fallback is used.
+ * Below threshold: output = d * multiplier  (linear, smooth for fine work)
+ * Above threshold: output ramps up quadratically (snappy for big swings)
+ *
+ * Parameters (set via pmw3610_set_acceleration):
+ *   multiplier  x100  base scaling (100 = 1:1 at low speed)
+ *   threshold         deltas <= this are purely linear
+ *   exponent    x100  acceleration growth (0=none, 20=mild, 50=strong)
  */
 
-static const uint16_t pow13_lookup[50] = {
-	 0,  1,  2,  4,  5,  7,  9, 11, 13, 15,
-	17, 19, 22, 24, 27, 29, 32, 34, 37, 39,
-	42, 45, 47, 50, 53, 56, 59, 62, 65, 68,
-	71, 74, 77, 80, 84, 87, 90, 94, 97,101,
-       104,108,111,115,118,122,126,129,133,137
-};
-
-static const uint16_t pow15_lookup[50] = {
-	 0,  1,  2,  5,  7, 11, 14, 18, 22, 27,
-	32, 37, 43, 49, 55, 62, 69, 76, 84, 92,
-       100,109,118,127,137,147,157,168,179,190,
-       202,214,226,239,252,265,279,293,307,322,
-       337,352,368,384,400,417,434,451,469,487
-};
-
-static const uint16_t pow20_lookup[50] = {
-	 0,   1,   4,   9,  16,  25,  36,  49,  64,  81,
-       100, 121, 144, 169, 196, 225, 256, 289, 324, 361,
-       400, 441, 484, 529, 576, 625, 676, 729, 784, 841,
-       900, 961,1024,1089,1156,1225,1296,1369,1444,1521,
-      1600,1681,1764,1849,1936,2025,2116,2209,2304,2401
-};
+#define ACCEL_LUT_SIZE  64
+#define ACCEL_FP_SHIFT  8   /* 8.8 fixed-point */
 
 /* ── Async init step definitions ───────────────────────────────────── */
 
@@ -100,9 +83,12 @@ struct pmw3610_data {
 
 	/* acceleration profile (runtime-configurable) */
 	uint16_t cpi;
-	uint16_t accel_multiplier;   /* ×100 */
+	uint16_t accel_multiplier;   /* x100 */
 	uint16_t accel_threshold;
-	uint16_t accel_exponent;     /* ×100: 0=linear, 50=pow1.3, 75=pow1.5, 100=pow2.0 */
+	uint16_t accel_exponent;     /* x100: growth factor for quadratic ramp */
+
+	/* pre-computed acceleration lookup table (8.8 fixed-point) */
+	uint16_t accel_lut[ACCEL_LUT_SIZE];
 };
 
 /* ── 3-wire SPI bit-bang (mode 3: CPOL=1 CPHA=1) ──────────────────── */
@@ -246,6 +232,45 @@ int pmw3610_set_cpi(const struct device *dev, uint16_t cpi)
 
 /* ── Acceleration control ──────────────────────────────────────────── */
 
+/*
+ * Rebuild the acceleration LUT from current parameters.
+ * Called once when parameters change — never on the hot path.
+ *
+ * Model:
+ *   d <= threshold:  out = d * mul            (linear, pixel-accurate)
+ *   d >  threshold:  out = d * mul * (1 + growth * excess^2)
+ *
+ * where excess = (d - threshold), growth = exponent / 10000.0
+ * The quadratic ramp feels natural: gentle onset, strong at big flicks.
+ *
+ * Output stored as 8.8 fixed-point so small multipliers don't lose precision.
+ */
+static void rebuild_accel_lut(struct pmw3610_data *data)
+{
+	float mul = data->accel_multiplier / 100.0f;
+	float growth = data->accel_exponent / 10000.0f;
+	uint8_t thr = data->accel_threshold;
+
+	for (int d = 0; d < ACCEL_LUT_SIZE; d++) {
+		float out;
+		if (d <= thr || data->accel_exponent == 0) {
+			out = d * mul;
+		} else {
+			float excess = d - thr;
+			out = d * mul * (1.0f + growth * excess * excess);
+		}
+		/* Clamp to uint16_t range (max representable: 255.99) */
+		uint32_t fp = (uint32_t)(out * (1 << ACCEL_FP_SHIFT) + 0.5f);
+		data->accel_lut[d] = (uint16_t)MIN(fp, UINT16_MAX);
+	}
+
+	LOG_INF("Accel LUT rebuilt: mul=%u/100 thr=%u growth=%u/100 "
+		"lut[1]=%u lut[10]=%u lut[30]=%u lut[63]=%u",
+		data->accel_multiplier, thr, data->accel_exponent,
+		data->accel_lut[1], data->accel_lut[10],
+		data->accel_lut[30], data->accel_lut[63]);
+}
+
 int pmw3610_set_acceleration(const struct device *dev,
 			     uint16_t multiplier,
 			     uint16_t threshold,
@@ -254,49 +279,36 @@ int pmw3610_set_acceleration(const struct device *dev,
 	struct pmw3610_data *data = dev->data;
 
 	data->accel_multiplier = multiplier;
-	data->accel_threshold = threshold;
-	data->accel_exponent = MIN(exponent, 100);
+	data->accel_threshold = MIN(threshold, ACCEL_LUT_SIZE - 1);
+	data->accel_exponent = exponent;
 
-	LOG_INF("Acceleration: mul=%u/100 thr=%u exp=%u/100",
-		multiplier, threshold, exponent);
+	rebuild_accel_lut(data);
 	return 0;
 }
 
-static int16_t apply_acceleration(const struct pmw3610_data *data, int16_t dt)
+/*
+ * Hot-path acceleration: pure integer LUT lookup, no floats.
+ * Returns 8.8 fixed-point so the fractional accumulator preserves sub-pixel precision.
+ */
+static int32_t apply_acceleration_fp(const struct pmw3610_data *data, int16_t dt)
 {
-	uint8_t delta = abs(dt);
-	if (delta == 0) return 0;
+	if (dt == 0) return 0;
 
-	int32_t mul = data->accel_multiplier;
-	uint16_t thr = data->accel_threshold;
-	uint16_t exp = data->accel_exponent;
+	int sign = (dt > 0) ? 1 : -1;
+	uint16_t d = (uint16_t)abs(dt);
+	uint32_t out;
 
-	if (delta <= thr || exp == 0) {
-		/* Below threshold or linear mode: just apply base multiplier */
-		return (int16_t)((dt * mul) / 100);
-	}
-
-	/* Select lookup table based on exponent */
-	const uint16_t *lut;
-	uint16_t lut_fallback;
-
-	if (exp <= 40) {
-		lut = pow13_lookup;
-		lut_fallback = 12;
-	} else if (exp <= 65) {
-		lut = pow15_lookup;
-		lut_fallback = 22;
+	if (d < ACCEL_LUT_SIZE) {
+		out = data->accel_lut[d];
 	} else {
-		lut = pow20_lookup;
-		lut_fallback = 50;
+		/* Linear extrapolation beyond LUT */
+		uint16_t last = data->accel_lut[ACCEL_LUT_SIZE - 1];
+		uint16_t prev = data->accel_lut[ACCEL_LUT_SIZE - 2];
+		uint16_t slope = last - prev;
+		out = last + (uint32_t)slope * (d - ACCEL_LUT_SIZE + 1);
 	}
 
-	float powish = (delta < 50) ? (float)lut[delta] : (float)(delta * lut_fallback);
-	float result = dt * (1.0f + (powish * 0.06f) / 256.0f);
-	int16_t accel_dt = (int16_t)result;
-
-	/* Apply base multiplier */
-	return (int16_t)((accel_dt * mul) / 100);
+	return sign * (int32_t)out;
 }
 
 /* ── Downshift / sample time configuration ─────────────────────────── */
@@ -463,7 +475,7 @@ static void pmw3610_async_init(struct k_work *work)
 
 /* ── Motion data processing & reporting ────────────────────────────── */
 
-/* 12-bit two's complement → int16_t (from little-wing) */
+/* 12-bit two's complement -> int16_t (from little-wing) */
 #define TOINT16(val, bits) (((struct { int16_t value : bits; }){val}).value)
 
 static int pmw3610_report_data(const struct device *dev)
@@ -473,8 +485,8 @@ static int pmw3610_report_data(const struct device *dev)
 
 	if (unlikely(!data->ready)) return -EBUSY;
 
-	static int64_t dx_acc = 0;
-	static int64_t dy_acc = 0;
+	static int32_t dx_acc = 0;
+	static int32_t dy_acc = 0;
 
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
 	static int64_t last_smp_time = 0;
@@ -490,6 +502,12 @@ static int pmw3610_report_data(const struct device *dev)
 			     ((buf[PMW3610_XY_H_POS] & 0xF0) << 4)), 12);
 	int16_t y = TOINT16((buf[PMW3610_Y_L_POS] +
 			     ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12);
+
+	/* Reject obviously corrupted SPI reads.
+	 * At 800 CPI / 8ms, max plausible single-read delta is ~100. */
+	if (abs(x) > 200 || abs(y) > 200) {
+		return 0;
+	}
 
 #if IS_ENABLED(CONFIG_PMW3610_SWAP_XY)
 	int16_t tmp = x; x = y; y = tmp;
@@ -514,10 +532,17 @@ static int pmw3610_report_data(const struct device *dev)
 	}
 #endif
 
+	/* Fractional accumulator for sub-pixel precision (8.8 fixed-point).
+	 * Carries remainder across reports so slow movements stay smooth. */
+	static int32_t frac_x = 0;
+	static int32_t frac_y = 0;
+
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
 	if (now - last_smp_time >= CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
 		dx_acc = 0;
 		dy_acc = 0;
+		frac_x = 0;
+		frac_y = 0;
 	}
 	last_smp_time = now;
 #endif
@@ -531,16 +556,27 @@ static int pmw3610_report_data(const struct device *dev)
 	}
 #endif
 
-	/* Apply acceleration */
-	int16_t rx = apply_acceleration(data, (int16_t)CLAMP(dx_acc, INT16_MIN, INT16_MAX));
-	int16_t ry = apply_acceleration(data, (int16_t)CLAMP(dy_acc, INT16_MIN, INT16_MAX));
+	/* Apply acceleration via LUT (8.8 fixed-point) */
+	int16_t dx_in = (int16_t)CLAMP(dx_acc, INT16_MIN, INT16_MAX);
+	int16_t dy_in = (int16_t)CLAMP(dy_acc, INT16_MIN, INT16_MAX);
+
+	frac_x += apply_acceleration_fp(data, dx_in);
+	frac_y += apply_acceleration_fp(data, dy_in);
+
+	/* Extract integer part, keep fractional remainder */
+	int16_t rx = (int16_t)(frac_x >> ACCEL_FP_SHIFT);
+	int16_t ry = (int16_t)(frac_y >> ACCEL_FP_SHIFT);
+	frac_x -= (int32_t)rx << ACCEL_FP_SHIFT;
+	frac_y -= (int32_t)ry << ACCEL_FP_SHIFT;
+
+	/* Always consume accumulated input and update report time */
+	dx_acc = 0;
+	dy_acc = 0;
+#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+	last_rpt_time = now;
+#endif
 
 	if (rx != 0 || ry != 0) {
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-		last_rpt_time = now;
-#endif
-		dx_acc = 0;
-		dy_acc = 0;
 
 		if (rx != 0) {
 			input_report_rel(dev, INPUT_REL_X, rx, ry == 0, K_NO_WAIT);
@@ -616,9 +652,10 @@ static int pmw3610_init(const struct device *dev)
 	data->cpi = cfg->cpi;
 
 	/* Default acceleration profile */
-	data->accel_multiplier = 100; /* 1.0× */
+	data->accel_multiplier = 100; /* 1.0x */
 	data->accel_threshold = 5;
-	data->accel_exponent = 50;    /* pow1.3 curve */
+	data->accel_exponent = 20;    /* mild quadratic growth */
+	rebuild_accel_lut(data);
 
 	/* Configure GPIOs */
 	if (!gpio_is_ready_dt(&cfg->cs_gpio) ||
