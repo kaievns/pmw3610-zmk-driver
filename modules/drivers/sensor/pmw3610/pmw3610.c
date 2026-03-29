@@ -2,8 +2,8 @@
  * PMW3610 ultra-low-power optical motion sensor — Zephyr input driver
  *
  * Hardware SPI with 3-wire SDIO (MOSI and MISO wired to the same pin).
- * Runtime-configurable acceleration profiles (CPI + power curve).
- * Deep-sleep via SHUTDOWN register.
+ * Reports raw relative X/Y deltas — acceleration and axis transforms
+ * are handled by ZMK input processors in the listener pipeline.
  *
  * Init is async (non-blocking) using delayable work items so other
  * SPI peripherals are not blocked during boot.
@@ -25,23 +25,6 @@
 #include "pmw3610.h"
 
 LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
-
-/* ── Acceleration ──────────────────────────────────────────────────── *
- *
- * Pre-computed LUT mapping input delta -> output delta (8.8 fixed-point).
- * Rebuilt whenever acceleration parameters change.
- *
- * Model:  output = d^(exponent/100)
- *
- * Smooth power curve with no threshold discontinuity.
- *   exponent=100  linear (no acceleration)
- *   exponent=120  mild (MX Ergo-like)
- *   exponent=140  moderate
- *   exponent=200  strong
- */
-
-#define ACCEL_LUT_SIZE  128
-#define ACCEL_FP_SHIFT  8   /* 8.8 fixed-point */
 
 /* ── Async init step definitions ───────────────────────────────────── */
 
@@ -77,13 +60,7 @@ struct pmw3610_data {
 	bool ready;
 	bool sw_smart_flag;
 	int err;
-
-	/* acceleration profile */
 	uint16_t cpi;
-	uint16_t accel_exponent;
-
-	/* pre-computed acceleration lookup table (8.8 fixed-point) */
-	uint16_t accel_lut[ACCEL_LUT_SIZE];
 };
 
 /* ── SPI register access ──────────────────────────────────────────── *
@@ -122,7 +99,6 @@ static int pmw3610_write_reg(const struct device *dev, uint8_t reg, uint8_t val)
 	return spi_write_dt(&cfg->spi, &tx);
 }
 
-/* Write with SPI clock enable/disable (required for config registers) */
 static int pmw3610_write(const struct device *dev, uint8_t reg, uint8_t val)
 {
 	pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
@@ -134,7 +110,6 @@ static int pmw3610_write(const struct device *dev, uint8_t reg, uint8_t val)
 	return err;
 }
 
-/* Burst read: single transaction, CS stays asserted throughout */
 static int pmw3610_burst_read(const struct device *dev, uint8_t reg,
 			      uint8_t *buf, uint8_t len)
 {
@@ -185,88 +160,6 @@ int pmw3610_set_cpi(const struct device *dev, uint16_t cpi)
 	}
 
 	return err;
-}
-
-/* ── Acceleration control ──────────────────────────────────────────── */
-
-/*
- * Lightweight base^exp without math.h.
- * Uses log2/exp2 decomposition with polynomial approximation.
- * Accurate to <1% for base in [1, 128], exp in [1.0, 2.0].
- */
-static float approx_powf(float base, float exponent)
-{
-	if (base <= 1.0f) return base;
-
-	/* log2(base): decompose base = 2^n × m, m in [1,2) */
-	float m = base;
-	int n = 0;
-	while (m >= 2.0f) { m *= 0.5f; n++; }
-
-	/* log2(m) for m in [1,2): Remez minimax polynomial */
-	float log2_m = -1.7417939f + m * (2.8212026f +
-			m * (-1.4699568f + m * 0.44717955f));
-	float y = exponent * (n + log2_m);
-
-	/* 2^y: split into integer + fraction */
-	int yi = (int)y;
-	float yf = y - yi;
-
-	float result = 1.0f;
-	for (int i = 0; i < yi; i++) result *= 2.0f;
-
-	/* 2^yf for yf in [0,1): Taylor-derived polynomial */
-	result *= 1.0f + yf * (0.6931472f + yf * (0.2402265f + yf * 0.0558011f));
-
-	return result;
-}
-
-static void rebuild_accel_lut(struct pmw3610_data *data)
-{
-	float power = data->accel_exponent / 100.0f;
-
-	if (power < 1.0f) power = 1.0f;
-
-	data->accel_lut[0] = 0;
-	for (int d = 1; d < ACCEL_LUT_SIZE; d++) {
-		float out = approx_powf((float)d, power);
-		uint32_t fp = (uint32_t)(out * (1 << ACCEL_FP_SHIFT) + 0.5f);
-		data->accel_lut[d] = (uint16_t)MIN(fp, UINT16_MAX);
-	}
-
-	LOG_INF("Accel LUT rebuilt: power=%u/100 "
-		"lut[1]=%u lut[5]=%u lut[10]=%u lut[30]=%u",
-		data->accel_exponent,
-		data->accel_lut[1], data->accel_lut[5],
-		data->accel_lut[10], data->accel_lut[30]);
-}
-
-int pmw3610_set_acceleration(const struct device *dev, uint16_t exponent)
-{
-	struct pmw3610_data *data = dev->data;
-	data->accel_exponent = exponent;
-	rebuild_accel_lut(data);
-	return 0;
-}
-
-static int32_t apply_acceleration_fp(const struct pmw3610_data *data, int16_t dt)
-{
-	if (dt == 0) return 0;
-
-	int sign = (dt > 0) ? 1 : -1;
-	uint16_t d = (uint16_t)abs(dt);
-	uint32_t out;
-
-	if (d < ACCEL_LUT_SIZE) {
-		out = data->accel_lut[d];
-	} else {
-		uint16_t last = data->accel_lut[ACCEL_LUT_SIZE - 1];
-		uint16_t prev = data->accel_lut[ACCEL_LUT_SIZE - 2];
-		uint16_t slope = last - prev;
-		out = last + (uint32_t)slope * (d - ACCEL_LUT_SIZE + 1);
-	}
-
-	return sign * (int32_t)out;
 }
 
 /* ── Downshift / sample time configuration ─────────────────────────── */
@@ -460,16 +353,6 @@ static int pmw3610_report_data(const struct device *dev)
 	int16_t y = TOINT16((buf[PMW3610_Y_L_POS] +
 			     ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12);
 
-#if IS_ENABLED(CONFIG_PMW3610_SWAP_XY)
-	int16_t tmp = x; x = y; y = tmp;
-#endif
-#if IS_ENABLED(CONFIG_PMW3610_INVERT_X)
-	x = -x;
-#endif
-#if IS_ENABLED(CONFIG_PMW3610_INVERT_Y)
-	y = -y;
-#endif
-
 #ifdef CONFIG_PMW3610_SMART_ALGORITHM
 	int16_t shutter = ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8)
 			+ buf[PMW3610_SHUTTER_L_POS];
@@ -500,11 +383,8 @@ static int pmw3610_report_data(const struct device *dev)
 	}
 #endif
 
-	/* Apply acceleration and report */
-	int16_t rx = (int16_t)(apply_acceleration_fp(data,
-			(int16_t)CLAMP(dx_acc, INT16_MIN, INT16_MAX)) >> ACCEL_FP_SHIFT);
-	int16_t ry = (int16_t)(apply_acceleration_fp(data,
-			(int16_t)CLAMP(dy_acc, INT16_MIN, INT16_MAX)) >> ACCEL_FP_SHIFT);
+	int16_t rx = (int16_t)CLAMP(dx_acc, INT16_MIN, INT16_MAX);
+	int16_t ry = (int16_t)CLAMP(dy_acc, INT16_MIN, INT16_MAX);
 
 	dx_acc = 0;
 	dy_acc = 0;
@@ -585,17 +465,11 @@ static int pmw3610_init(const struct device *dev)
 	data->sw_smart_flag = false;
 	data->cpi = cfg->cpi;
 
-	/* Default acceleration: d^1.2 power curve */
-	data->accel_exponent = 120;
-	rebuild_accel_lut(data);
-
-	/* Verify SPI bus is ready */
 	if (!spi_is_ready_dt(&cfg->spi)) {
 		LOG_ERR("SPI bus not ready");
 		return -ENODEV;
 	}
 
-	/* Configure motion interrupt GPIO */
 	if (!gpio_is_ready_dt(&cfg->motion_gpio)) {
 		LOG_ERR("Motion GPIO not ready");
 		return -ENODEV;
@@ -611,7 +485,6 @@ static int pmw3610_init(const struct device *dev)
 
 	k_work_init(&data->trigger_work, pmw3610_work_callback);
 
-	/* Kick off async init */
 	k_work_init_delayable(&data->init_work, pmw3610_async_init);
 	k_work_schedule(&data->init_work, K_MSEC(async_init_delay[0]));
 

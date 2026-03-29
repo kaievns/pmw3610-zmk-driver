@@ -10,15 +10,6 @@ menuconfig PMW3610
 
 if PMW3610
 
-config PMW3610_SWAP_XY
-	bool "Swap the X/Y axes"
-
-config PMW3610_INVERT_X
-	bool "Invert the X axis"
-
-config PMW3610_INVERT_Y
-	bool "Invert the Y axis"
-
 config PMW3610_REPORT_INTERVAL_MIN
 	int "Minimum report interval (ms)"
 	default 12
