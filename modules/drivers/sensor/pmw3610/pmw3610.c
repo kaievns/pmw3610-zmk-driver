@@ -1,20 +1,19 @@
 /*
  * PMW3610 ultra-low-power optical motion sensor — Zephyr input driver
  *
- * GPIO bit-bang 3-wire SPI (bidirectional SDIO) for the little-eye breakout.
- * Ported from little-wing/zmk-pmw3610-driver with additions:
- *   - GPIO bit-bang instead of hardware SPIM (3-wire SDIO)
- *   - Runtime-configurable acceleration profiles (CPI + curve)
- *   - Deep-sleep via SHUTDOWN register + NCS wake
+ * Hardware SPI with 3-wire SDIO (MOSI and MISO wired to the same pin).
+ * Runtime-configurable acceleration profiles (CPI + power curve).
+ * Deep-sleep via SHUTDOWN register.
  *
- * Init is async (non-blocking) using delayable work items so the
- * display and other SPI peripherals are not blocked during boot.
+ * Init is async (non-blocking) using delayable work items so other
+ * SPI peripherals are not blocked during boot.
  */
 
 #define DT_DRV_COMPAT pixart_pmw3610
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
+#include <zephyr/drivers/spi.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/input/input.h>
 #include <zephyr/pm/device.h>
@@ -32,16 +31,16 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
  * Pre-computed LUT mapping input delta -> output delta (8.8 fixed-point).
  * Rebuilt whenever acceleration parameters change.
  *
- * Below threshold: output = d * multiplier  (linear, smooth for fine work)
- * Above threshold: output ramps up quadratically (snappy for big swings)
+ * Model:  output = d^(exponent/100)
  *
- * Parameters (set via pmw3610_set_acceleration):
- *   multiplier  x100  base scaling (100 = 1:1 at low speed)
- *   threshold         deltas <= this are purely linear
- *   exponent    x100  acceleration growth (0=none, 20=mild, 50=strong)
+ * Smooth power curve with no threshold discontinuity.
+ *   exponent=100  linear (no acceleration)
+ *   exponent=120  mild (MX Ergo-like)
+ *   exponent=140  moderate
+ *   exponent=200  strong
  */
 
-#define ACCEL_LUT_SIZE  64
+#define ACCEL_LUT_SIZE  128
 #define ACCEL_FP_SHIFT  8   /* 8.8 fixed-point */
 
 /* ── Async init step definitions ───────────────────────────────────── */
@@ -55,18 +54,16 @@ enum pmw3610_init_step {
 };
 
 static const int32_t async_init_delay[ASYNC_INIT_STEP_COUNT] = {
-	[ASYNC_INIT_STEP_POWER_UP]  = 60,   /* > 10 ms, extra margin for cold boot */
-	[ASYNC_INIT_STEP_CLEAR_OB1] = 200,  /* wait for self-test */
-	[ASYNC_INIT_STEP_CHECK_OB1] = 50,   /* verify self-test + product ID */
+	[ASYNC_INIT_STEP_POWER_UP]  = 60,
+	[ASYNC_INIT_STEP_CLEAR_OB1] = 200,
+	[ASYNC_INIT_STEP_CHECK_OB1] = 50,
 	[ASYNC_INIT_STEP_CONFIGURE] = 0,
 };
 
 /* ── Per-instance data ─────────────────────────────────────────────── */
 
 struct pmw3610_config {
-	struct gpio_dt_spec cs_gpio;
-	struct gpio_dt_spec clk_gpio;
-	struct gpio_dt_spec sdio_gpio;
+	struct spi_dt_spec spi;
 	struct gpio_dt_spec motion_gpio;
 	uint16_t cpi;
 };
@@ -81,85 +78,48 @@ struct pmw3610_data {
 	bool sw_smart_flag;
 	int err;
 
-	/* acceleration profile (runtime-configurable) */
+	/* acceleration profile */
 	uint16_t cpi;
-	uint16_t accel_multiplier;   /* x100 */
-	uint16_t accel_threshold;
-	uint16_t accel_exponent;     /* x100: growth factor for quadratic ramp */
+	uint16_t accel_exponent;
 
 	/* pre-computed acceleration lookup table (8.8 fixed-point) */
 	uint16_t accel_lut[ACCEL_LUT_SIZE];
 };
 
-/* ── 3-wire SPI bit-bang (mode 3: CPOL=1 CPHA=1) ──────────────────── */
-
-static inline void spi_cs_assert(const struct pmw3610_config *cfg)
-{
-	gpio_pin_set_dt(&cfg->cs_gpio, 1);
-}
-
-static inline void spi_cs_deassert(const struct pmw3610_config *cfg)
-{
-	gpio_pin_set_dt(&cfg->cs_gpio, 0);
-}
-
-static void spi_write_byte(const struct pmw3610_config *cfg, uint8_t val)
-{
-	gpio_pin_configure_dt(&cfg->sdio_gpio, GPIO_OUTPUT);
-
-	for (int i = 7; i >= 0; i--) {
-		gpio_pin_set_dt(&cfg->clk_gpio, 0);
-		gpio_pin_set_dt(&cfg->sdio_gpio, (val >> i) & 1);
-		k_busy_wait(1);
-		gpio_pin_set_dt(&cfg->clk_gpio, 1);
-		k_busy_wait(1);
-	}
-}
-
-static uint8_t spi_read_byte(const struct pmw3610_config *cfg)
-{
-	uint8_t val = 0;
-	gpio_pin_configure_dt(&cfg->sdio_gpio, GPIO_INPUT);
-
-	for (int i = 7; i >= 0; i--) {
-		gpio_pin_set_dt(&cfg->clk_gpio, 0);
-		k_busy_wait(1);
-		gpio_pin_set_dt(&cfg->clk_gpio, 1);
-		val |= (gpio_pin_get_dt(&cfg->sdio_gpio) & 1) << i;
-		k_busy_wait(1);
-	}
-
-	return val;
-}
-
-/* ── Register access with SPI clock enable/disable ─────────────────── */
+/* ── SPI register access ──────────────────────────────────────────── *
+ *
+ * Single spi_transceive_dt calls keep CS asserted for the entire
+ * transaction.  The PMW3610 needs T_SRAD (4 us) between address and
+ * data, but at <= 2 MHz the SPIM inter-byte gap + DMA turnaround
+ * provides sufficient delay (same approach as little-wing).
+ */
 
 static int pmw3610_read_reg(const struct device *dev, uint8_t reg, uint8_t *val)
 {
 	const struct pmw3610_config *cfg = dev->config;
+	uint8_t addr = reg & 0x7F;
 
-	spi_cs_assert(cfg);
-	spi_write_byte(cfg, reg & 0x7F);
-	k_busy_wait(T_SRAD_US);
-	*val = spi_read_byte(cfg);
-	spi_cs_deassert(cfg);
-	k_busy_wait(T_BEXIT_US);
-	gpio_pin_configure_dt(&cfg->sdio_gpio, GPIO_OUTPUT);
+	const struct spi_buf tx_buf = { .buf = &addr, .len = 1 };
+	const struct spi_buf_set tx = { .buffers = &tx_buf, .count = 1 };
 
-	return 0;
+	struct spi_buf rx_bufs[] = {
+		{ .buf = NULL, .len = 1 },   /* skip address byte */
+		{ .buf = val, .len = 1 },
+	};
+	const struct spi_buf_set rx = { .buffers = rx_bufs, .count = 2 };
+
+	return spi_transceive_dt(&cfg->spi, &tx, &rx);
 }
 
 static int pmw3610_write_reg(const struct device *dev, uint8_t reg, uint8_t val)
 {
 	const struct pmw3610_config *cfg = dev->config;
+	uint8_t buf[] = { reg | SPI_WRITE_BIT, val };
 
-	spi_cs_assert(cfg);
-	spi_write_byte(cfg, reg | SPI_WRITE_BIT);
-	spi_write_byte(cfg, val);
-	spi_cs_deassert(cfg);
-	k_busy_wait(T_BEXIT_US);
+	const struct spi_buf tx_buf = { .buf = buf, .len = sizeof(buf) };
+	const struct spi_buf_set tx = { .buffers = &tx_buf, .count = 1 };
 
-	return 0;
+	return spi_write_dt(&cfg->spi, &tx);
 }
 
 /* Write with SPI clock enable/disable (required for config registers) */
@@ -174,25 +134,23 @@ static int pmw3610_write(const struct device *dev, uint8_t reg, uint8_t val)
 	return err;
 }
 
-/* Burst read: send address once, read N consecutive bytes */
+/* Burst read: single transaction, CS stays asserted throughout */
 static int pmw3610_burst_read(const struct device *dev, uint8_t reg,
 			      uint8_t *buf, uint8_t len)
 {
 	const struct pmw3610_config *cfg = dev->config;
+	uint8_t addr = reg & 0x7F;
 
-	spi_cs_assert(cfg);
-	spi_write_byte(cfg, reg & 0x7F);
-	k_busy_wait(T_SRAD_US);
+	const struct spi_buf tx_buf = { .buf = &addr, .len = 1 };
+	const struct spi_buf_set tx = { .buffers = &tx_buf, .count = 1 };
 
-	for (uint8_t i = 0; i < len; i++) {
-		buf[i] = spi_read_byte(cfg);
-	}
+	struct spi_buf rx_bufs[] = {
+		{ .buf = NULL, .len = 1 },   /* skip address byte */
+		{ .buf = buf, .len = len },
+	};
+	const struct spi_buf_set rx = { .buffers = rx_bufs, .count = 2 };
 
-	spi_cs_deassert(cfg);
-	k_busy_wait(T_BEXIT_US);
-	gpio_pin_configure_dt(&cfg->sdio_gpio, GPIO_OUTPUT);
-
-	return 0;
+	return spi_transceive_dt(&cfg->spi, &tx, &rx);
 }
 
 /* ── CPI control ───────────────────────────────────────────────────── */
@@ -208,7 +166,6 @@ int pmw3610_set_cpi(const struct device *dev, uint16_t cpi)
 
 	uint8_t value = cpi / 200;
 
-	/* CPI register requires page switch + SPI clock */
 	uint8_t addr[] = { PMW3610_REG_SPI_PAGE0, PMW3610_REG_RES_STEP, PMW3610_REG_SPI_PAGE0 };
 	uint8_t vals[] = { 0xFF, value, 0x00 };
 
@@ -233,63 +190,65 @@ int pmw3610_set_cpi(const struct device *dev, uint16_t cpi)
 /* ── Acceleration control ──────────────────────────────────────────── */
 
 /*
- * Rebuild the acceleration LUT from current parameters.
- * Called once when parameters change — never on the hot path.
- *
- * Model:
- *   d <= threshold:  out = d * mul            (linear, pixel-accurate)
- *   d >  threshold:  out = d * mul * (1 + growth * excess^2)
- *
- * where excess = (d - threshold), growth = exponent / 10000.0
- * The quadratic ramp feels natural: gentle onset, strong at big flicks.
- *
- * Output stored as 8.8 fixed-point so small multipliers don't lose precision.
+ * Lightweight base^exp without math.h.
+ * Uses log2/exp2 decomposition with polynomial approximation.
+ * Accurate to <1% for base in [1, 128], exp in [1.0, 2.0].
  */
+static float approx_powf(float base, float exponent)
+{
+	if (base <= 1.0f) return base;
+
+	/* log2(base): decompose base = 2^n × m, m in [1,2) */
+	float m = base;
+	int n = 0;
+	while (m >= 2.0f) { m *= 0.5f; n++; }
+
+	/* log2(m) for m in [1,2): Remez minimax polynomial */
+	float log2_m = -1.7417939f + m * (2.8212026f +
+			m * (-1.4699568f + m * 0.44717955f));
+	float y = exponent * (n + log2_m);
+
+	/* 2^y: split into integer + fraction */
+	int yi = (int)y;
+	float yf = y - yi;
+
+	float result = 1.0f;
+	for (int i = 0; i < yi; i++) result *= 2.0f;
+
+	/* 2^yf for yf in [0,1): Taylor-derived polynomial */
+	result *= 1.0f + yf * (0.6931472f + yf * (0.2402265f + yf * 0.0558011f));
+
+	return result;
+}
+
 static void rebuild_accel_lut(struct pmw3610_data *data)
 {
-	float mul = data->accel_multiplier / 100.0f;
-	float growth = data->accel_exponent / 10000.0f;
-	uint8_t thr = data->accel_threshold;
+	float power = data->accel_exponent / 100.0f;
 
-	for (int d = 0; d < ACCEL_LUT_SIZE; d++) {
-		float out;
-		if (d <= thr || data->accel_exponent == 0) {
-			out = d * mul;
-		} else {
-			float excess = d - thr;
-			out = d * mul * (1.0f + growth * excess * excess);
-		}
-		/* Clamp to uint16_t range (max representable: 255.99) */
+	if (power < 1.0f) power = 1.0f;
+
+	data->accel_lut[0] = 0;
+	for (int d = 1; d < ACCEL_LUT_SIZE; d++) {
+		float out = approx_powf((float)d, power);
 		uint32_t fp = (uint32_t)(out * (1 << ACCEL_FP_SHIFT) + 0.5f);
 		data->accel_lut[d] = (uint16_t)MIN(fp, UINT16_MAX);
 	}
 
-	LOG_INF("Accel LUT rebuilt: mul=%u/100 thr=%u growth=%u/100 "
-		"lut[1]=%u lut[10]=%u lut[30]=%u lut[63]=%u",
-		data->accel_multiplier, thr, data->accel_exponent,
-		data->accel_lut[1], data->accel_lut[10],
-		data->accel_lut[30], data->accel_lut[63]);
+	LOG_INF("Accel LUT rebuilt: power=%u/100 "
+		"lut[1]=%u lut[5]=%u lut[10]=%u lut[30]=%u",
+		data->accel_exponent,
+		data->accel_lut[1], data->accel_lut[5],
+		data->accel_lut[10], data->accel_lut[30]);
 }
 
-int pmw3610_set_acceleration(const struct device *dev,
-			     uint16_t multiplier,
-			     uint16_t threshold,
-			     uint16_t exponent)
+int pmw3610_set_acceleration(const struct device *dev, uint16_t exponent)
 {
 	struct pmw3610_data *data = dev->data;
-
-	data->accel_multiplier = multiplier;
-	data->accel_threshold = MIN(threshold, ACCEL_LUT_SIZE - 1);
 	data->accel_exponent = exponent;
-
 	rebuild_accel_lut(data);
 	return 0;
 }
 
-/*
- * Hot-path acceleration: pure integer LUT lookup, no floats.
- * Returns 8.8 fixed-point so the fractional accumulator preserves sub-pixel precision.
- */
 static int32_t apply_acceleration_fp(const struct pmw3610_data *data, int16_t dt)
 {
 	if (dt == 0) return 0;
@@ -301,7 +260,6 @@ static int32_t apply_acceleration_fp(const struct pmw3610_data *data, int16_t dt
 	if (d < ACCEL_LUT_SIZE) {
 		out = data->accel_lut[d];
 	} else {
-		/* Linear extrapolation beyond LUT */
 		uint16_t last = data->accel_lut[ACCEL_LUT_SIZE - 1];
 		uint16_t prev = data->accel_lut[ACCEL_LUT_SIZE - 2];
 		uint16_t slope = last - prev;
@@ -475,7 +433,6 @@ static void pmw3610_async_init(struct k_work *work)
 
 /* ── Motion data processing & reporting ────────────────────────────── */
 
-/* 12-bit two's complement -> int16_t (from little-wing) */
 #define TOINT16(val, bits) (((struct { int16_t value : bits; }){val}).value)
 
 static int pmw3610_report_data(const struct device *dev)
@@ -503,12 +460,6 @@ static int pmw3610_report_data(const struct device *dev)
 	int16_t y = TOINT16((buf[PMW3610_Y_L_POS] +
 			     ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12);
 
-	/* Reject obviously corrupted SPI reads.
-	 * At 800 CPI / 8ms, max plausible single-read delta is ~100. */
-	if (abs(x) > 200 || abs(y) > 200) {
-		return 0;
-	}
-
 #if IS_ENABLED(CONFIG_PMW3610_SWAP_XY)
 	int16_t tmp = x; x = y; y = tmp;
 #endif
@@ -532,17 +483,10 @@ static int pmw3610_report_data(const struct device *dev)
 	}
 #endif
 
-	/* Fractional accumulator for sub-pixel precision (8.8 fixed-point).
-	 * Carries remainder across reports so slow movements stay smooth. */
-	static int32_t frac_x = 0;
-	static int32_t frac_y = 0;
-
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
 	if (now - last_smp_time >= CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
 		dx_acc = 0;
 		dy_acc = 0;
-		frac_x = 0;
-		frac_y = 0;
 	}
 	last_smp_time = now;
 #endif
@@ -556,20 +500,12 @@ static int pmw3610_report_data(const struct device *dev)
 	}
 #endif
 
-	/* Apply acceleration via LUT (8.8 fixed-point) */
-	int16_t dx_in = (int16_t)CLAMP(dx_acc, INT16_MIN, INT16_MAX);
-	int16_t dy_in = (int16_t)CLAMP(dy_acc, INT16_MIN, INT16_MAX);
+	/* Apply acceleration and report */
+	int16_t rx = (int16_t)(apply_acceleration_fp(data,
+			(int16_t)CLAMP(dx_acc, INT16_MIN, INT16_MAX)) >> ACCEL_FP_SHIFT);
+	int16_t ry = (int16_t)(apply_acceleration_fp(data,
+			(int16_t)CLAMP(dy_acc, INT16_MIN, INT16_MAX)) >> ACCEL_FP_SHIFT);
 
-	frac_x += apply_acceleration_fp(data, dx_in);
-	frac_y += apply_acceleration_fp(data, dy_in);
-
-	/* Extract integer part, keep fractional remainder */
-	int16_t rx = (int16_t)(frac_x >> ACCEL_FP_SHIFT);
-	int16_t ry = (int16_t)(frac_y >> ACCEL_FP_SHIFT);
-	frac_x -= (int32_t)rx << ACCEL_FP_SHIFT;
-	frac_y -= (int32_t)ry << ACCEL_FP_SHIFT;
-
-	/* Always consume accumulated input and update report time */
 	dx_acc = 0;
 	dy_acc = 0;
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
@@ -577,7 +513,6 @@ static int pmw3610_report_data(const struct device *dev)
 #endif
 
 	if (rx != 0 || ry != 0) {
-
 		if (rx != 0) {
 			input_report_rel(dev, INPUT_REL_X, rx, ry == 0, K_NO_WAIT);
 		}
@@ -626,7 +561,6 @@ static int pmw3610_pm_action(const struct device *dev,
 		return 0;
 
 	case PM_DEVICE_ACTION_RESUME:
-		/* Full re-init via async sequence */
 		data->async_init_step = 0;
 		k_work_schedule(&data->init_work,
 				K_MSEC(async_init_delay[0]));
@@ -651,34 +585,25 @@ static int pmw3610_init(const struct device *dev)
 	data->sw_smart_flag = false;
 	data->cpi = cfg->cpi;
 
-	/* Default acceleration profile */
-	data->accel_multiplier = 100; /* 1.0x */
-	data->accel_threshold = 5;
-	data->accel_exponent = 20;    /* mild quadratic growth */
+	/* Default acceleration: d^1.2 power curve */
+	data->accel_exponent = 120;
 	rebuild_accel_lut(data);
 
-	/* Configure GPIOs */
-	if (!gpio_is_ready_dt(&cfg->cs_gpio) ||
-	    !gpio_is_ready_dt(&cfg->clk_gpio) ||
-	    !gpio_is_ready_dt(&cfg->sdio_gpio) ||
-	    !gpio_is_ready_dt(&cfg->motion_gpio)) {
-		LOG_ERR("GPIO device(s) not ready");
+	/* Verify SPI bus is ready */
+	if (!spi_is_ready_dt(&cfg->spi)) {
+		LOG_ERR("SPI bus not ready");
 		return -ENODEV;
 	}
 
-	ret = gpio_pin_configure_dt(&cfg->cs_gpio, GPIO_OUTPUT_INACTIVE);
-	if (ret) return ret;
-
-	ret = gpio_pin_configure_dt(&cfg->clk_gpio, GPIO_OUTPUT_ACTIVE); /* idle HIGH */
-	if (ret) return ret;
-
-	ret = gpio_pin_configure_dt(&cfg->sdio_gpio, GPIO_OUTPUT);
-	if (ret) return ret;
+	/* Configure motion interrupt GPIO */
+	if (!gpio_is_ready_dt(&cfg->motion_gpio)) {
+		LOG_ERR("Motion GPIO not ready");
+		return -ENODEV;
+	}
 
 	ret = gpio_pin_configure_dt(&cfg->motion_gpio, GPIO_INPUT);
 	if (ret) return ret;
 
-	/* Motion interrupt */
 	gpio_init_callback(&data->motion_cb, pmw3610_gpio_callback,
 			   BIT(cfg->motion_gpio.pin));
 	ret = gpio_add_callback(cfg->motion_gpio.port, &data->motion_cb);
@@ -698,9 +623,9 @@ static int pmw3610_init(const struct device *dev)
 #define PMW3610_INST(n)                                                \
 	static struct pmw3610_data pmw3610_data_##n;                   \
 	static const struct pmw3610_config pmw3610_config_##n = {      \
-		.cs_gpio     = GPIO_DT_SPEC_INST_GET(n, cs_gpios),    \
-		.clk_gpio    = GPIO_DT_SPEC_INST_GET(n, clk_gpios),   \
-		.sdio_gpio   = GPIO_DT_SPEC_INST_GET(n, sdio_gpios),  \
+		.spi         = SPI_DT_SPEC_INST_GET(n,                \
+				SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | \
+				SPI_TRANSFER_MSB, 0),                  \
 		.motion_gpio = GPIO_DT_SPEC_INST_GET(n, motion_gpios), \
 		.cpi         = DT_PROP(DT_DRV_INST(n), cpi),          \
 	};                                                             \

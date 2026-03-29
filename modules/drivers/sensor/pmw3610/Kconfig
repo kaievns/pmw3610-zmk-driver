@@ -1,11 +1,12 @@
 menuconfig PMW3610
 	bool "PMW3610 mouse optical sensor"
 	default n
+	depends on SPI
 	depends on GPIO
 	depends on INPUT
 	help
 	  Enable driver for the PixArt PMW3610 optical motion sensor.
-	  Uses GPIO bit-bang 3-wire SPI for the bidirectional SDIO line.
+	  Uses hardware SPI with 3-wire SDIO (MOSI/MISO on same pin).
 
 if PMW3610
 
