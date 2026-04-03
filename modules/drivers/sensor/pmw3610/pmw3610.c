@@ -9,7 +9,7 @@
  * SPI peripherals are not blocked during boot.
  */
 
-#define DT_DRV_COMPAT pixart_pmw3610
+#define DT_DRV_COMPAT pixart_pmw3610_custom
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -512,7 +512,7 @@ DT_INST_FOREACH_STATUS_OKAY(PMW3610_INST)
 
 #define GET_PMW3610_DEV(node_id) DEVICE_DT_GET(node_id),
 static const struct device *pmw3610_devs[] = {
-	DT_FOREACH_STATUS_OKAY(pixart_pmw3610, GET_PMW3610_DEV)
+	DT_FOREACH_STATUS_OKAY(pixart_pmw3610_custom, GET_PMW3610_DEV)
 };
 
 static int on_activity_state(const zmk_event_t *eh)

@@ -1,0 +1,20 @@
+description: |
+  PixArt PMW3610 ultra-low-power optical motion sensor (trackball).
+  SPI device with 3-wire SDIO (connect MOSI and MISO to the same SDIO line).
+
+compatible: "pixart,pmw3610-custom"
+
+include: spi-device.yaml
+
+properties:
+  motion-gpios:
+    type: phandle-array
+    required: true
+    description: Motion interrupt GPIO (active-low).
+
+  cpi:
+    type: int
+    default: 800
+    description: |
+      Initial CPI (counts per inch), range 200-3200.
+      Must be a multiple of 200.
