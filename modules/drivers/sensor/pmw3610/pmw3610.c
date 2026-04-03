@@ -63,9 +63,10 @@ struct pmw3610_data {
 	struct k_work_delayable init_work;
 	int async_init_step;
 	bool ready;
-	bool sw_smart_flag;
 	int err;
 	uint16_t cpi;
+	int32_t dx_acc;
+	int32_t dy_acc;
 };
 
 /* ── SPI register access ──────────────────────────────────────────── *
@@ -340,11 +341,7 @@ static int pmw3610_report_data(const struct device *dev)
 
 	if (unlikely(!data->ready)) return -EBUSY;
 
-	static int32_t dx_acc = 0;
-	static int32_t dy_acc = 0;
-
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-	static int64_t last_smp_time = 0;
 	static int64_t last_rpt_time = 0;
 	int64_t now = k_uptime_get();
 #endif
@@ -353,34 +350,18 @@ static int pmw3610_report_data(const struct device *dev)
 				     buf, sizeof(buf));
 	if (err) return err;
 
+	if (!(buf[0] & 0x80)) {
+		return 0;
+	}
+
 	int16_t x = TOINT16((buf[PMW3610_X_L_POS] +
 			     ((buf[PMW3610_XY_H_POS] & 0xF0) << 4)), 12);
 	int16_t y = TOINT16((buf[PMW3610_Y_L_POS] +
 			     ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12);
 
-#ifdef CONFIG_PMW3610_SMART_ALGORITHM
-	int16_t shutter = ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8)
-			+ buf[PMW3610_SHUTTER_L_POS];
-	if (data->sw_smart_flag && shutter < 45) {
-		pmw3610_write(dev, 0x32, 0x00);
-		data->sw_smart_flag = false;
-	}
-	if (!data->sw_smart_flag && shutter > 45) {
-		pmw3610_write(dev, 0x32, 0x80);
-		data->sw_smart_flag = true;
-	}
-#endif
 
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-	if (now - last_smp_time >= CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
-		dx_acc = 0;
-		dy_acc = 0;
-	}
-	last_smp_time = now;
-#endif
-
-	dx_acc += x;
-	dy_acc += y;
+	data->dx_acc += x;
+	data->dy_acc += y;
 
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
 	if (now - last_rpt_time < CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
@@ -388,11 +369,11 @@ static int pmw3610_report_data(const struct device *dev)
 	}
 #endif
 
-	int16_t rx = (int16_t)CLAMP(dx_acc, INT16_MIN, INT16_MAX);
-	int16_t ry = (int16_t)CLAMP(dy_acc, INT16_MIN, INT16_MAX);
+	int16_t rx = (int16_t)CLAMP(data->dx_acc, INT16_MIN, INT16_MAX);
+	int16_t ry = (int16_t)CLAMP(data->dy_acc, INT16_MIN, INT16_MAX);
 
-	dx_acc = 0;
-	dy_acc = 0;
+	data->dx_acc = 0;
+	data->dy_acc = 0;
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
 	last_rpt_time = now;
 #endif
@@ -467,7 +448,6 @@ static int pmw3610_init(const struct device *dev)
 
 	data->dev = dev;
 	data->ready = false;
-	data->sw_smart_flag = false;
 	data->cpi = cfg->cpi;
 
 	if (!spi_is_ready_dt(&cfg->spi)) {

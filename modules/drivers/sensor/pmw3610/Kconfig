@@ -18,13 +18,6 @@ config PMW3610_REPORT_INTERVAL_MIN
 	  Set to 0 for maximum responsiveness (USB).
 	  12 ms works well for BLE split keyboards.
 
-config PMW3610_SMART_ALGORITHM
-	bool "Enable surface coverage enhancement algorithm"
-	default n
-	help
-	  Extends tracking across a wider range of surfaces
-	  (granites, tiles) at the cost of slightly more power.
-
 config PMW3610_RUN_DOWNSHIFT_TIME_MS
 	int "RUN → REST1 downshift time (ms)"
 	default 128
