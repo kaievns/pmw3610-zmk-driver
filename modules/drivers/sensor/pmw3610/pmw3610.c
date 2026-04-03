@@ -136,7 +136,7 @@ static int pmw3610_burst_read(const struct device *dev, uint8_t reg,
 
 /* ── CPI control ───────────────────────────────────────────────────── */
 
-int pmw3610_set_cpi(const struct device *dev, uint16_t cpi)
+static int pmw3610_set_cpi(const struct device *dev, uint16_t cpi)
 {
 	struct pmw3610_data *data = dev->data;
 
