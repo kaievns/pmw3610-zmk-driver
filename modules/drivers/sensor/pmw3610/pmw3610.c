@@ -26,6 +26,11 @@
 
 LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
 
+/* ── Dedicated work queue for motion processing ────────────────────── */
+
+K_THREAD_STACK_DEFINE(pmw3610_work_stack, 1024);
+static struct k_work_q pmw3610_work_q;
+
 /* ── Async init step definitions ───────────────────────────────────── */
 
 enum pmw3610_init_step {
@@ -413,7 +418,7 @@ static void pmw3610_gpio_callback(const struct device *gpiob,
 	const struct device *dev = data->dev;
 
 	pmw3610_set_interrupt(dev, false);
-	k_work_submit(&data->trigger_work);
+	k_work_submit_to_queue(&pmw3610_work_q, &data->trigger_work);
 }
 
 static void pmw3610_work_callback(struct k_work *work)
@@ -482,6 +487,15 @@ static int pmw3610_init(const struct device *dev)
 			   BIT(cfg->motion_gpio.pin));
 	ret = gpio_add_callback(cfg->motion_gpio.port, &data->motion_cb);
 	if (ret) return ret;
+
+	static bool work_q_started;
+	if (!work_q_started) {
+		k_work_queue_init(&pmw3610_work_q);
+		k_work_queue_start(&pmw3610_work_q, pmw3610_work_stack,
+				   K_THREAD_STACK_SIZEOF(pmw3610_work_stack),
+				   K_PRIO_COOP(4), NULL);
+		work_q_started = true;
+	}
 
 	k_work_init(&data->trigger_work, pmw3610_work_callback);
 
