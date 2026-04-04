@@ -19,6 +19,7 @@
 #include <zephyr/pm/device.h>
 #include <zephyr/logging/log.h>
 #include <stdlib.h>
+#include <zephyr/sys/util.h>
 
 #include <zmk/events/activity_state_changed.h>
 
@@ -332,8 +333,6 @@ static void pmw3610_async_init(struct k_work *work)
 
 /* ── Motion data processing & reporting ────────────────────────────── */
 
-#define TOINT16(val, bits) (((struct { int16_t value : bits; }){val}).value)
-
 static int pmw3610_report_data(const struct device *dev)
 {
 	struct pmw3610_data *data = dev->data;
@@ -354,10 +353,10 @@ static int pmw3610_report_data(const struct device *dev)
 		return 0;
 	}
 
-	int16_t x = TOINT16((buf[PMW3610_X_L_POS] +
-			     ((buf[PMW3610_XY_H_POS] & 0xF0) << 4)), 12);
-	int16_t y = TOINT16((buf[PMW3610_Y_L_POS] +
-			     ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12);
+	int16_t x = sign_extend(((buf[PMW3610_XY_H_POS] & 0xF0) << 4) |
+				 buf[PMW3610_X_L_POS], 11);
+	int16_t y = sign_extend(((buf[PMW3610_XY_H_POS] & 0x0F) << 8) |
+				 buf[PMW3610_Y_L_POS], 11);
 
 
 	data->dx_acc += x;
@@ -427,6 +426,8 @@ static int pmw3610_pm_action(const struct device *dev,
 		return 0;
 
 	case PM_DEVICE_ACTION_RESUME:
+		pmw3610_write_reg(dev, PMW3610_REG_POWER_UP_RESET,
+				  PMW3610_POWERUP_CMD_WAKEUP);
 		data->async_init_step = 0;
 		k_work_schedule(&data->init_work,
 				K_MSEC(async_init_delay[0]));
@@ -492,6 +493,7 @@ static int pmw3610_init(const struct device *dev)
 	static const struct pmw3610_config pmw3610_config_##n = {      \
 		.spi         = SPI_DT_SPEC_INST_GET(n,                \
 				SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | \
+				SPI_MODE_CPOL | SPI_MODE_CPHA |        \
 				SPI_TRANSFER_MSB, 0),                  \
 		.motion_gpio = GPIO_DT_SPEC_INST_GET(n, motion_gpios), \
 		.cpi         = DT_PROP(DT_DRV_INST(n), cpi),          \
