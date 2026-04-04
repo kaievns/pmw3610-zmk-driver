@@ -19,6 +19,14 @@ properties:
       Initial CPI (counts per inch), range 200-3200.
       Must be a multiple of 200.
 
+  invert-x:
+    type: boolean
+    description: Invert X axis in hardware via the RES_STEP register.
+
+  invert-y:
+    type: boolean
+    description: Invert Y axis in hardware via the RES_STEP register.
+
   smart-mode:
     type: boolean
     description: |

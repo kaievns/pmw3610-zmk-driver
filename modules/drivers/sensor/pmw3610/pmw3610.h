@@ -81,6 +81,11 @@
 #define PMW3610_MIN_CPI              200
 #define PMW3610_MAX_CPI              3200
 
+/* RES_STEP register bits (page 1) */
+#define PMW3610_RES_STEP_INV_X_BIT   6
+#define PMW3610_RES_STEP_INV_Y_BIT   5
+#define PMW3610_RES_STEP_RES_MASK    0x1F
+
 /* SPI write bit */
 #define SPI_WRITE_BIT                BIT(7)
 

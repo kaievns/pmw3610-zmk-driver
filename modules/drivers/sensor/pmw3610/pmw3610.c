@@ -56,6 +56,8 @@ struct pmw3610_config {
 	struct gpio_dt_spec motion_gpio;
 	uint16_t cpi;
 	bool smart_mode;
+	bool invert_x;
+	bool invert_y;
 };
 
 struct pmw3610_data {
@@ -147,24 +149,33 @@ static int pmw3610_set_cpi(const struct device *dev, uint16_t cpi)
 		return -EINVAL;
 	}
 
-	uint8_t value = cpi / 200;
-
-	uint8_t addr[] = { PMW3610_REG_SPI_PAGE0, PMW3610_REG_RES_STEP, PMW3610_REG_SPI_PAGE0 };
-	uint8_t vals[] = { 0xFF, value, 0x00 };
+	const struct pmw3610_config *cfg = dev->config;
 
 	pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
 	k_busy_wait(T_CLOCK_ON_DELAY_US);
 
-	int err = 0;
-	for (size_t i = 0; i < ARRAY_SIZE(addr) && !err; i++) {
-		err = pmw3610_write_reg(dev, addr[i], vals[i]);
+	int err = pmw3610_write_reg(dev, PMW3610_REG_SPI_PAGE0, 0xFF);
+	if (!err) {
+		uint8_t val;
+
+		err = pmw3610_read_reg(dev, PMW3610_REG_RES_STEP, &val);
+		if (!err) {
+			val &= ~PMW3610_RES_STEP_RES_MASK;
+			val |= (cpi / 200) & PMW3610_RES_STEP_RES_MASK;
+			WRITE_BIT(val, PMW3610_RES_STEP_INV_X_BIT, cfg->invert_x);
+			WRITE_BIT(val, PMW3610_RES_STEP_INV_Y_BIT, cfg->invert_y);
+			err = pmw3610_write_reg(dev, PMW3610_REG_RES_STEP, val);
+		}
+	}
+	if (!err) {
+		err = pmw3610_write_reg(dev, PMW3610_REG_SPI_PAGE0, 0x00);
 	}
 
 	pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE);
 
 	if (!err) {
 		data->cpi = cpi;
-		LOG_INF("CPI set to %u (reg=0x%02x)", cpi, value);
+		LOG_INF("CPI set to %u", cpi);
 	}
 
 	return err;
@@ -364,7 +375,6 @@ static int pmw3610_report_data(const struct device *dev)
 	int16_t y = sign_extend(((buf[PMW3610_XY_H_POS] & 0x0F) << 8) |
 				 buf[PMW3610_Y_L_POS], 11);
 
-
 	data->dx_acc += x;
 	data->dy_acc += y;
 
@@ -504,6 +514,8 @@ static int pmw3610_init(const struct device *dev)
 		.motion_gpio = GPIO_DT_SPEC_INST_GET(n, motion_gpios), \
 		.cpi         = DT_PROP(DT_DRV_INST(n), cpi),          \
 		.smart_mode  = DT_PROP(DT_DRV_INST(n), smart_mode),   \
+		.invert_x    = DT_PROP(DT_DRV_INST(n), invert_x),    \
+		.invert_y    = DT_PROP(DT_DRV_INST(n), invert_y),    \
 	};                                                             \
 	PM_DEVICE_DT_INST_DEFINE(n, pmw3610_pm_action);                \
 	DEVICE_DT_INST_DEFINE(n,                                       \
