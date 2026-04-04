@@ -38,6 +38,8 @@
 #define PMW3610_REG_REST2_DOWNSHIFT  0x1F
 #define PMW3610_REG_REST3_RATE       0x20
 
+#define PMW3610_REG_SMART_MODE       0x32
+
 #define PMW3610_REG_OBSERVATION      0x2D
 #define PMW3610_REG_PIXEL_GRAB       0x35
 #define PMW3610_REG_FRAME_GRAB       0x36
@@ -61,6 +63,9 @@
 #define PMW3610_SPI_CLOCK_CMD_DISABLE 0xB5
 
 #define PMW3610_SHUTDOWN_VAL         0xB6
+
+#define PMW3610_SMART_MODE_ENABLE    0x00
+#define PMW3610_SMART_MODE_DISABLE   0x80
 
 /* Burst read size: motion + dx_l + dy_l + dxy_h + squal + shutter_h + shutter_l */
 #define PMW3610_BURST_SIZE           7

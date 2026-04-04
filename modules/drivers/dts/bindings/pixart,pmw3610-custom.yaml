@@ -18,3 +18,9 @@ properties:
     description: |
       Initial CPI (counts per inch), range 200-3200.
       Must be a multiple of 200.
+
+  smart-mode:
+    type: boolean
+    description: |
+      Enable the smart tracking algorithm for improved tracking on
+      difficult surfaces. Off by default.

@@ -55,6 +55,7 @@ struct pmw3610_config {
 	struct spi_dt_spec spi;
 	struct gpio_dt_spec motion_gpio;
 	uint16_t cpi;
+	bool smart_mode;
 };
 
 struct pmw3610_data {
@@ -278,6 +279,11 @@ static int pmw3610_async_init_configure(const struct device *dev)
 		err = pmw3610_read_reg(dev, reg, &dummy);
 	}
 
+	if (!err) {
+		err = pmw3610_write(dev, PMW3610_REG_SMART_MODE,
+				    cfg->smart_mode ? PMW3610_SMART_MODE_ENABLE
+						    : PMW3610_SMART_MODE_DISABLE);
+	}
 	if (!err) err = pmw3610_set_performance(dev, true);
 	if (!err) err = pmw3610_set_cpi(dev, cfg->cpi);
 
@@ -497,6 +503,7 @@ static int pmw3610_init(const struct device *dev)
 				SPI_TRANSFER_MSB, 0),                  \
 		.motion_gpio = GPIO_DT_SPEC_INST_GET(n, motion_gpios), \
 		.cpi         = DT_PROP(DT_DRV_INST(n), cpi),          \
+		.smart_mode  = DT_PROP(DT_DRV_INST(n), smart_mode),   \
 	};                                                             \
 	PM_DEVICE_DT_INST_DEFINE(n, pmw3610_pm_action);                \
 	DEVICE_DT_INST_DEFINE(n,                                       \
