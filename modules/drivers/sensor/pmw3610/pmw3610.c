@@ -71,6 +71,7 @@ struct pmw3610_data {
 	uint16_t cpi;
 	int32_t dx_acc;
 	int32_t dy_acc;
+	int64_t last_rpt_time;
 };
 
 /* ── SPI register access ──────────────────────────────────────────── *
@@ -358,7 +359,6 @@ static int pmw3610_report_data(const struct device *dev)
 	if (unlikely(!data->ready)) return -EBUSY;
 
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-	static int64_t last_rpt_time = 0;
 	int64_t now = k_uptime_get();
 #endif
 
@@ -379,7 +379,7 @@ static int pmw3610_report_data(const struct device *dev)
 	data->dy_acc += y;
 
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-	if (now - last_rpt_time < CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
+	if (now - data->last_rpt_time < CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
 		return 0;
 	}
 #endif
@@ -390,7 +390,7 @@ static int pmw3610_report_data(const struct device *dev)
 	data->dx_acc = 0;
 	data->dy_acc = 0;
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-	last_rpt_time = now;
+	data->last_rpt_time = now;
 #endif
 
 	if (rx != 0 || ry != 0) {
@@ -438,12 +438,12 @@ static int pmw3610_pm_action(const struct device *dev,
 	case PM_DEVICE_ACTION_SUSPEND:
 		data->ready = false;
 		pmw3610_set_interrupt(dev, false);
-		pmw3610_write_reg(dev, PMW3610_REG_SHUTDOWN, PMW3610_SHUTDOWN_VAL);
+		pmw3610_write(dev, PMW3610_REG_SHUTDOWN, PMW3610_SHUTDOWN_VAL);
 		return 0;
 
 	case PM_DEVICE_ACTION_RESUME:
-		pmw3610_write_reg(dev, PMW3610_REG_POWER_UP_RESET,
-				  PMW3610_POWERUP_CMD_WAKEUP);
+		pmw3610_write(dev, PMW3610_REG_POWER_UP_RESET,
+			      PMW3610_POWERUP_CMD_WAKEUP);
 		data->async_init_step = 0;
 		k_work_schedule(&data->init_work,
 				K_MSEC(async_init_delay[0]));
