@@ -65,6 +65,9 @@ struct pmw3610_data {
 	struct gpio_callback motion_cb;
 	struct k_work trigger_work;
 	struct k_work_delayable init_work;
+#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+	struct k_work_delayable flush_work;
+#endif
 	int async_init_step;
 	bool ready;
 	int err;
@@ -361,16 +364,46 @@ static void pmw3610_async_init(struct k_work *work)
 
 /* ── Motion data processing & reporting ────────────────────────────── */
 
+/* Flush accumulated motion downstream. Safe to call with zero
+ * accumulated data — it's a no-op in that case. */
+static void pmw3610_flush_accumulated(const struct device *dev)
+{
+	struct pmw3610_data *data = dev->data;
+
+	int16_t rx = (int16_t)CLAMP(data->dx_acc, INT16_MIN, INT16_MAX);
+	int16_t ry = (int16_t)CLAMP(data->dy_acc, INT16_MIN, INT16_MAX);
+
+	data->dx_acc = 0;
+	data->dy_acc = 0;
+#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+	data->last_rpt_time = k_uptime_get();
+#endif
+
+	if (rx == 0 && ry == 0) return;
+
+	if (rx != 0) {
+		input_report_rel(dev, INPUT_REL_X, rx, ry == 0, K_NO_WAIT);
+	}
+	if (ry != 0) {
+		input_report_rel(dev, INPUT_REL_Y, ry, true, K_NO_WAIT);
+	}
+}
+
+#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+static void pmw3610_flush_work_cb(struct k_work *work)
+{
+	struct k_work_delayable *dw = k_work_delayable_from_work(work);
+	struct pmw3610_data *data = CONTAINER_OF(dw, struct pmw3610_data, flush_work);
+	pmw3610_flush_accumulated(data->dev);
+}
+#endif
+
 static int pmw3610_report_data(const struct device *dev)
 {
 	struct pmw3610_data *data = dev->data;
 	uint8_t buf[PMW3610_BURST_SIZE];
 
 	if (unlikely(!data->ready)) return -EBUSY;
-
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-	int64_t now = k_uptime_get();
-#endif
 
 	int err = pmw3610_burst_read(dev, PMW3610_REG_MOTION_BURST,
 				     buf, sizeof(buf));
@@ -389,29 +422,26 @@ static int pmw3610_report_data(const struct device *dev)
 	data->dy_acc += y;
 
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-	if (now - data->last_rpt_time < CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
+	int64_t now = k_uptime_get();
+	int64_t since = now - data->last_rpt_time;
+
+	if (since < CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
+		/* Throttled — schedule a delayed flush so accumulated
+		 * motion is always reported within the window, even if
+		 * the user stops moving before the next IRQ. Without
+		 * this, stale accumulated motion sits in dx_acc/dy_acc
+		 * until the next fresh move and gets prepended to it,
+		 * causing the cursor to replay old motion. */
+		int64_t remaining = CONFIG_PMW3610_REPORT_INTERVAL_MIN - since;
+		k_work_reschedule(&data->flush_work, K_MSEC(remaining));
 		return 0;
 	}
+
+	/* We're about to report now — cancel any pending flush. */
+	k_work_cancel_delayable(&data->flush_work);
 #endif
 
-	int16_t rx = (int16_t)CLAMP(data->dx_acc, INT16_MIN, INT16_MAX);
-	int16_t ry = (int16_t)CLAMP(data->dy_acc, INT16_MIN, INT16_MAX);
-
-	data->dx_acc = 0;
-	data->dy_acc = 0;
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-	data->last_rpt_time = now;
-#endif
-
-	if (rx != 0 || ry != 0) {
-		if (rx != 0) {
-			input_report_rel(dev, INPUT_REL_X, rx, ry == 0, K_NO_WAIT);
-		}
-		if (ry != 0) {
-			input_report_rel(dev, INPUT_REL_Y, ry, true, K_NO_WAIT);
-		}
-	}
-
+	pmw3610_flush_accumulated(dev);
 	return 0;
 }
 
@@ -505,6 +535,10 @@ static int pmw3610_init(const struct device *dev)
 	}
 
 	k_work_init(&data->trigger_work, pmw3610_work_callback);
+
+#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+	k_work_init_delayable(&data->flush_work, pmw3610_flush_work_cb);
+#endif
 
 	k_work_init_delayable(&data->init_work, pmw3610_async_init);
 	k_work_schedule(&data->init_work, K_MSEC(async_init_delay[0]));
