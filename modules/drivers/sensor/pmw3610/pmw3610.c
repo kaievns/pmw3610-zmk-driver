@@ -219,7 +219,17 @@ static int pmw3610_set_sample_time(const struct device *dev,
 static int pmw3610_set_performance(const struct device *dev, bool force_awake)
 {
 	uint8_t value;
+
+	/* Wake the SPI clock before reading — the sensor may be in
+	 * REST mode with the clock gated, so a raw read would return
+	 * garbage and we'd compute the wrong target register value. */
+	pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
+	k_busy_wait(T_CLOCK_ON_DELAY_US);
+
 	int err = pmw3610_read_reg(dev, PMW3610_REG_PERFORMANCE, &value);
+
+	pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE);
+
 	if (err) return err;
 
 	uint8_t perf = value & 0x0F;
@@ -541,9 +551,20 @@ static int on_activity_state(const zmk_event_t *eh)
 	struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
 	if (!ev) return 0;
 
+	/* Only react to ACTIVE <-> IDLE. SLEEP is handled by PM device
+	 * actions (pmw3610_pm_action) which run with proper ordering
+	 * against SPI peripheral suspend. Touching SPI from this listener
+	 * during sleep entry races with PM suspend and can hard-fault. */
+	if (ev->state != ZMK_ACTIVITY_ACTIVE && ev->state != ZMK_ACTIVITY_IDLE) {
+		return 0;
+	}
+
 	bool enable = (ev->state == ZMK_ACTIVITY_ACTIVE);
 	for (size_t i = 0; i < ARRAY_SIZE(pmw3610_devs); i++) {
-		pmw3610_set_performance(pmw3610_devs[i], enable);
+		const struct device *sensor = pmw3610_devs[i];
+		struct pmw3610_data *data = sensor->data;
+		if (!data->ready) continue;
+		pmw3610_set_performance(sensor, enable);
 	}
 	return 0;
 }
