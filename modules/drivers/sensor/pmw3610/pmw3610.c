@@ -65,14 +65,29 @@ struct pmw3610_data {
 	struct gpio_callback motion_cb;
 	struct k_work trigger_work;
 	struct k_work_delayable init_work;
+#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+	struct k_work_delayable flush_work;
+#endif
 	int async_init_step;
 	bool ready;
+	bool is_resume;  /* first async init step sends WAKEUP, not RESET */
 	int err;
 	uint16_t cpi;
 	int32_t dx_acc;
 	int32_t dy_acc;
 	int64_t last_rpt_time;
+	int64_t acc_ts;  /* timestamp of last accumulation into dx/dy_acc */
 };
+
+/* Accumulator is discarded if it's been sitting longer than this
+ * without a new IRQ. Prevents minutes-old trapped deltas from being
+ * prepended to fresh motion after a long pause. */
+#define PMW3610_ACC_STALE_MS 200
+
+/* flush_work won't push accumulated motion downstream unless the
+ * magnitude is at least this large. Filters out multi-pixel sensor
+ * twitches that escape the raw 1-pixel deadzone. */
+#define PMW3610_FLUSH_MIN_MAG 2
 
 /* ── SPI register access ──────────────────────────────────────────── *
  *
@@ -155,7 +170,7 @@ static int pmw3610_set_cpi(const struct device *dev, uint16_t cpi)
 	pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
 	k_busy_wait(T_CLOCK_ON_DELAY_US);
 
-	int err = pmw3610_write_reg(dev, PMW3610_REG_SPI_PAGE0, 0xFF);
+	int err = pmw3610_write_reg(dev, PMW3610_REG_PAGE_SELECT, PMW3610_PAGE1_VAL);
 	if (!err) {
 		uint8_t val;
 
@@ -169,7 +184,7 @@ static int pmw3610_set_cpi(const struct device *dev, uint16_t cpi)
 		}
 	}
 	if (!err) {
-		err = pmw3610_write_reg(dev, PMW3610_REG_SPI_PAGE0, 0x00);
+		err = pmw3610_write_reg(dev, PMW3610_REG_PAGE_SELECT, PMW3610_PAGE0_VAL);
 	}
 
 	pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE);
@@ -220,26 +235,27 @@ static int pmw3610_set_performance(const struct device *dev, bool force_awake)
 {
 	uint8_t value;
 
-	/* Wake the SPI clock before reading — the sensor may be in
-	 * REST mode with the clock gated, so a raw read would return
-	 * garbage and we'd compute the wrong target register value. */
+	/* Wake the SPI clock once for the whole read-modify-write.
+	 * The sensor may be in REST mode with the clock gated, so a
+	 * raw read would return garbage. Keeping the clock enabled
+	 * across both operations is both atomic and cheaper than two
+	 * separate clock-on/off cycles. */
 	pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
 	k_busy_wait(T_CLOCK_ON_DELAY_US);
 
 	int err = pmw3610_read_reg(dev, PMW3610_REG_PERFORMANCE, &value);
 
+	if (!err) {
+		uint8_t perf = value & 0x0F;
+		if (force_awake) {
+			perf |= 0xF0;
+		}
+		if (perf != value) {
+			err = pmw3610_write_reg(dev, PMW3610_REG_PERFORMANCE, perf);
+		}
+	}
+
 	pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE);
-
-	if (err) return err;
-
-	uint8_t perf = value & 0x0F;
-	if (force_awake) {
-		perf |= 0xF0;
-	}
-
-	if (perf != value) {
-		err = pmw3610_write(dev, PMW3610_REG_PERFORMANCE, perf);
-	}
 	return err;
 }
 
@@ -257,8 +273,14 @@ static int pmw3610_set_interrupt(const struct device *dev, bool en)
 
 static int pmw3610_async_init_power_up(const struct device *dev)
 {
-	return pmw3610_write_reg(dev, PMW3610_REG_POWER_UP_RESET,
-				 PMW3610_POWERUP_CMD_RESET);
+	struct pmw3610_data *data = dev->data;
+	uint8_t cmd = data->is_resume ? PMW3610_POWERUP_CMD_WAKEUP
+				      : PMW3610_POWERUP_CMD_RESET;
+
+	/* Clear the flag so subsequent cold reboots send RESET. */
+	data->is_resume = false;
+
+	return pmw3610_write_reg(dev, PMW3610_REG_POWER_UP_RESET, cmd);
 }
 
 static int pmw3610_async_init_clear_ob1(const struct device *dev)
@@ -361,6 +383,58 @@ static void pmw3610_async_init(struct k_work *work)
 
 /* ── Motion data processing & reporting ────────────────────────────── */
 
+/* Push accumulated motion to downstream listeners and reset the
+ * accumulator. Safe to call with empty accumulator (no-op). */
+static void pmw3610_emit_accumulated(const struct device *dev)
+{
+	struct pmw3610_data *data = dev->data;
+
+	int16_t rx = (int16_t)CLAMP(data->dx_acc, INT16_MIN, INT16_MAX);
+	int16_t ry = (int16_t)CLAMP(data->dy_acc, INT16_MIN, INT16_MAX);
+
+	data->dx_acc = 0;
+	data->dy_acc = 0;
+#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+	data->last_rpt_time = k_uptime_get();
+#endif
+
+	if (rx == 0 && ry == 0) return;
+
+	if (rx != 0) {
+		input_report_rel(dev, INPUT_REL_X, rx, ry == 0, K_NO_WAIT);
+	}
+	if (ry != 0) {
+		input_report_rel(dev, INPUT_REL_Y, ry, true, K_NO_WAIT);
+	}
+}
+
+#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+static void pmw3610_flush_work_cb(struct k_work *work)
+{
+	struct k_work_delayable *dw = k_work_delayable_from_work(work);
+	struct pmw3610_data *data = CONTAINER_OF(dw, struct pmw3610_data, flush_work);
+
+	/* Guard against phantom wake-ups: silently drop the accumulator
+	 * if total motion is below PMW3610_FLUSH_MIN_MAG.
+	 *
+	 * Note: with the raw-value deadzone upstream, any non-zero
+	 * accumulator already has |dx|+|dy| >= 2, so this guard is
+	 * functionally equivalent to the empty-flush check in
+	 * pmw3610_emit_accumulated today. It's kept as defense-in-depth
+	 * so that if the upstream deadzone is ever weakened or removed,
+	 * flush_work can't wake the host on trivial sensor twitches. */
+	int32_t mag = (data->dx_acc < 0 ? -data->dx_acc : data->dx_acc)
+		    + (data->dy_acc < 0 ? -data->dy_acc : data->dy_acc);
+	if (mag < PMW3610_FLUSH_MIN_MAG) {
+		data->dx_acc = 0;
+		data->dy_acc = 0;
+		return;
+	}
+
+	pmw3610_emit_accumulated(data->dev);
+}
+#endif
+
 static int pmw3610_report_data(const struct device *dev)
 {
 	struct pmw3610_data *data = dev->data;
@@ -368,9 +442,7 @@ static int pmw3610_report_data(const struct device *dev)
 
 	if (unlikely(!data->ready)) return -EBUSY;
 
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
 	int64_t now = k_uptime_get();
-#endif
 
 	int err = pmw3610_burst_read(dev, PMW3610_REG_MOTION_BURST,
 				     buf, sizeof(buf));
@@ -393,33 +465,38 @@ static int pmw3610_report_data(const struct device *dev)
 	if (y >= -1 && y <= 1) y = 0;
 	if (x == 0 && y == 0) return 0;
 
+	/* Staleness guard: if the accumulator has been sitting untouched
+	 * for longer than PMW3610_ACC_STALE_MS, discard it. Otherwise a
+	 * trapped delta from minutes ago could get prepended to fresh
+	 * motion, causing a visible cursor jump on the next movement. */
+	if (data->acc_ts != 0 && (now - data->acc_ts) > PMW3610_ACC_STALE_MS) {
+		data->dx_acc = 0;
+		data->dy_acc = 0;
+	}
+
 	data->dx_acc += x;
 	data->dy_acc += y;
+	data->acc_ts = now;
 
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-	if (now - data->last_rpt_time < CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
+	int64_t since = now - data->last_rpt_time;
+
+	if (since < CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
+		/* Throttled — schedule a delayed flush so accumulated
+		 * motion is always emitted within the window even if
+		 * the user stops moving before the next IRQ arrives.
+		 * The flush callback applies its own magnitude guard
+		 * to avoid waking the radios for single-digit twitches. */
+		int64_t remaining = CONFIG_PMW3610_REPORT_INTERVAL_MIN - since;
+		k_work_reschedule(&data->flush_work, K_MSEC(remaining));
 		return 0;
 	}
+
+	/* About to emit now — cancel any pending flush. */
+	k_work_cancel_delayable(&data->flush_work);
 #endif
 
-	int16_t rx = (int16_t)CLAMP(data->dx_acc, INT16_MIN, INT16_MAX);
-	int16_t ry = (int16_t)CLAMP(data->dy_acc, INT16_MIN, INT16_MAX);
-
-	data->dx_acc = 0;
-	data->dy_acc = 0;
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-	data->last_rpt_time = now;
-#endif
-
-	if (rx != 0 || ry != 0) {
-		if (rx != 0) {
-			input_report_rel(dev, INPUT_REL_X, rx, ry == 0, K_NO_WAIT);
-		}
-		if (ry != 0) {
-			input_report_rel(dev, INPUT_REL_Y, ry, true, K_NO_WAIT);
-		}
-	}
-
+	pmw3610_emit_accumulated(dev);
 	return 0;
 }
 
@@ -460,8 +537,12 @@ static int pmw3610_pm_action(const struct device *dev,
 		return 0;
 
 	case PM_DEVICE_ACTION_RESUME:
-		pmw3610_write(dev, PMW3610_REG_POWER_UP_RESET,
-			      PMW3610_POWERUP_CMD_WAKEUP);
+		/* Don't do synchronous SPI here — the SPI controller may
+		 * not have finished its own PM resume yet, which can hard
+		 * fault or return stale data. Defer to the async worker,
+		 * and flag this as a resume so the first step sends the
+		 * WAKEUP command instead of a full RESET. */
+		data->is_resume = true;
 		data->async_init_step = 0;
 		k_work_schedule(&data->init_work,
 				K_MSEC(async_init_delay[0]));
@@ -513,6 +594,10 @@ static int pmw3610_init(const struct device *dev)
 	}
 
 	k_work_init(&data->trigger_work, pmw3610_work_callback);
+
+#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+	k_work_init_delayable(&data->flush_work, pmw3610_flush_work_cb);
+#endif
 
 	k_work_init_delayable(&data->init_work, pmw3610_async_init);
 	k_work_schedule(&data->init_work, K_MSEC(async_init_delay[0]));

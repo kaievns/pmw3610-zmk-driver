@@ -50,8 +50,12 @@
 #define PMW3610_REG_SPI_CLK_ON_REQ   0x41
 #define PMW3610_REG_RES_STEP         0x85
 
-#define PMW3610_REG_SPI_PAGE0        0x7F
-#define PMW3610_REG_SPI_PAGE1        0xFF
+/* Page select: write PMW3610_PAGE_{0,1}_VAL to PMW3610_REG_PAGE_SELECT
+ * to switch register pages. PAGE0 is the default; PAGE1 holds the
+ * RES_STEP register used for CPI and axis inversion. */
+#define PMW3610_REG_PAGE_SELECT      0x7F
+#define PMW3610_PAGE0_VAL            0x00
+#define PMW3610_PAGE1_VAL            0xFF
 
 /* ── Constants ─────────────────────────────────────────────────────── */
 #define PMW3610_PRODUCT_ID           0x3E
