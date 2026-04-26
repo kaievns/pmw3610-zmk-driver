@@ -1,0 +1,8 @@
+description: Splits a packed-XY event from the PMW3610 driver back into
+  separate REL_X and REL_Y events. Pass-through for any non-packed event.
+
+compatible: "zmk,input-processor-pmw3610-unpack-xy"
+
+include: ip_zero_param.yaml
+
+properties: {}

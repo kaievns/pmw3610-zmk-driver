@@ -18,6 +18,18 @@ config PMW3610_REPORT_INTERVAL_MIN
 	  Set to 0 for maximum responsiveness (USB).
 	  12 ms works well for BLE split keyboards.
 
+config PMW3610_PACKED_REPORTS
+	bool "Pack X+Y into a single input event"
+	default n
+	help
+	  When enabled, the driver emits one combined event per motion
+	  report (custom code PMW3610_REL_PACKED_XY, X in high 16 bits,
+	  Y in low 16 bits) instead of two separate REL_X / REL_Y events.
+	  Halves the split BLE notify rate for diagonal motion. Requires
+	  the matching zip_pmw3610_unpack_xy input processor to run on
+	  the consumer side (typically the central) — without it, motion
+	  events go nowhere.
+
 config PMW3610_RUN_DOWNSHIFT_TIME_MS
 	int "RUN → REST1 downshift time (ms)"
 	default 128
@@ -48,3 +60,15 @@ module-str = PMW3610
 source "${ZEPHYR_BASE}/subsys/logging/Kconfig.template.log_config"
 
 endif # PMW3610
+
+# Unpack input processor — built on the consumer side (typically central),
+# which doesn't have CONFIG_PMW3610=y, so this stays outside the if-block.
+config ZMK_INPUT_PROCESSOR_PMW3610_UNPACK_XY
+	bool "Unpack PMW3610 packed-XY events"
+	default y if DT_HAS_ZMK_INPUT_PROCESSOR_PMW3610_UNPACK_XY_ENABLED
+	help
+	  Input processor that splits a packed-XY event back into separate
+	  REL_X and REL_Y events for downstream processors and listeners.
+	  Pass-through for any non-packed event, so it's safe to leave in
+	  the pipeline regardless of whether packing is enabled on the
+	  producing side.

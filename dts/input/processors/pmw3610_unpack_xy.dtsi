@@ -1,0 +1,6 @@
+/ {
+    /omit-if-no-ref/ zip_pmw3610_unpack_xy: zip_pmw3610_unpack_xy {
+        compatible = "zmk,input-processor-pmw3610-unpack-xy";
+        #input-processor-cells = <0>;
+    };
+};

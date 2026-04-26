@@ -19,6 +19,8 @@ used with ZMK input processors pipeline.
 - Rate-limited reporting with delayed flush for BLE stability
 - PM device suspend/resume with deferred SPI initialisation
 - Smart tracking mode for difficult surfaces
+- Optional packed-XY emit mode that halves split-BLE notify rate for
+  diagonal motion, with a matching unpack input processor
 
 ## Usage
 
@@ -68,8 +70,58 @@ EXTRA_MODULES := /path/to/pmw3610-zmk-driver
 
 ```
 CONFIG_PMW3610=y
-CONFIG_PMW3610_REPORT_INTERVAL_MIN=8
+CONFIG_PMW3610_REPORT_INTERVAL_MIN=12
 ```
+
+## Packed-XY transport (optional)
+
+By default the driver emits motion as two separate Zephyr input events per
+report (`INPUT_REL_X` then `INPUT_REL_Y`). On a split BLE keyboard this
+becomes two GATT notifies per diagonal-motion report, which dominates the
+peripheral->central traffic at high CPI where almost every report is
+diagonal.
+
+Enable `CONFIG_PMW3610_PACKED_REPORTS` on the side that hosts the sensor
+(typically the peripheral) and the driver instead emits one event per
+report with code `PMW3610_REL_PACKED_XY` (0x40, outside Linux's standard
+REL range so it can't collide). The 32-bit value carries signed X in the
+high 16 bits and signed Y in the low 16 bits.
+
+```
+# in the trackball-side .conf
+CONFIG_PMW3610=y
+CONFIG_PMW3610_REPORT_INTERVAL_MIN=12
+CONFIG_PMW3610_PACKED_REPORTS=y
+```
+
+A matching input processor (`zip_pmw3610_unpack_xy`, ships with this
+module) reverses the packing on the consumer side. It rewrites the
+current event in place to the X half and re-emits the Y half via
+`input_report_rel` on the same source device. Wire it as the **first**
+stage of your listener pipeline so downstream processors and the input
+listener see normal `REL_X` / `REL_Y` events:
+
+```dts
+trackball_listener {
+    compatible = "zmk,input-listener";
+    device = <&split_input>;
+    input-processors =
+        <&zip_pmw3610_unpack_xy>,
+        <&zip_spike_filter 5>,
+        /* ... rest of the pipeline ... */
+        ;
+};
+```
+
+The unpack processor passes through any non-packed event unchanged, so
+it's safe to leave it wired in regardless of whether the producing side
+has packing turned on. `CONFIG_ZMK_INPUT_PROCESSOR_PMW3610_UNPACK_XY`
+auto-enables when the device-tree node is referenced.
+
+In a typical left-central / right-peripheral split with the trackball on
+the right: turn `CONFIG_PMW3610_PACKED_REPORTS=y` on in the right shield
+config, and put `&zip_pmw3610_unpack_xy` at the head of the central's
+trackball listener pipeline.
 
 ## Copyright & License
 

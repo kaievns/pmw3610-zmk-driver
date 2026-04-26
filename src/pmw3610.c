@@ -400,12 +400,26 @@ static void pmw3610_emit_accumulated(const struct device *dev)
 
 	if (rx == 0 && ry == 0) return;
 
+#if CONFIG_PMW3610_PACKED_REPORTS
+	if (rx != 0 || ry != 0) {
+		/* Single packed notify: X in high 16 bits, Y in low 16 bits. Cast
+		 * via uint16_t first to avoid UB from left-shifting a sign-extended
+		 * negative int. The unpack input processor reverses this on the
+		 * consumer side. */
+		uint32_t hi = (uint16_t)rx;
+		uint32_t lo = (uint16_t)ry;
+		int32_t  packed = (int32_t)((hi << 16) | lo);
+		input_report(dev, INPUT_EV_REL, PMW3610_REL_PACKED_XY, packed,
+				true, K_NO_WAIT);
+	}
+#else
 	if (rx != 0) {
 		input_report_rel(dev, INPUT_REL_X, rx, ry == 0, K_NO_WAIT);
 	}
 	if (ry != 0) {
 		input_report_rel(dev, INPUT_REL_Y, ry, true, K_NO_WAIT);
 	}
+#endif
 }
 
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0

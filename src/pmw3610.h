@@ -98,4 +98,11 @@
 #define T_SRAD_US                    4
 #define T_BEXIT_US                   1
 
+/* Packed-XY transport code: when CONFIG_PMW3610_PACKED_REPORTS is set, the
+ * driver emits a single INPUT_EV_REL event with this code per motion report.
+ * The high 16 bits of `value` carry signed X, the low 16 bits carry signed Y.
+ * Outside the standard Linux REL_* range so it can't collide. The matching
+ * unpack input processor in this module reverses this on the consumer side. */
+#define PMW3610_REL_PACKED_XY        0x40
+
 #endif /* PMW3610_H_ */
