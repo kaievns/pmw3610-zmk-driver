@@ -191,7 +191,7 @@ static int pmw3610_set_cpi(const struct device *dev, uint16_t cpi)
 
 	if (!err) {
 		data->cpi = cpi;
-		LOG_INF("CPI set to %u", cpi);
+		LOG_DBG("CPI set to %u", cpi);
 	}
 
 	return err;
@@ -308,7 +308,7 @@ static int pmw3610_async_init_check_ob1(const struct device *dev)
 		return -EIO;
 	}
 
-	LOG_INF("PMW3610 detected (ID 0x%02x)", pid);
+	LOG_DBG("PMW3610 detected (ID 0x%02x)", pid);
 	return 0;
 }
 
@@ -361,7 +361,7 @@ static void pmw3610_async_init(struct k_work *work)
 	struct pmw3610_data *data = CONTAINER_OF(dwork, struct pmw3610_data, init_work);
 	const struct device *dev = data->dev;
 
-	LOG_INF("PMW3610 async init step %d", data->async_init_step);
+	LOG_DBG("PMW3610 async init step %d", data->async_init_step);
 
 	data->err = async_init_fn[data->async_init_step](dev);
 	if (data->err) {
@@ -373,7 +373,7 @@ static void pmw3610_async_init(struct k_work *work)
 
 	if (data->async_init_step == ASYNC_INIT_STEP_COUNT) {
 		data->ready = true;
-		LOG_INF("PMW3610 ready (CPI=%u)", data->cpi);
+		LOG_DBG("PMW3610 ready (CPI=%u)", data->cpi);
 		pmw3610_set_interrupt(dev, true);
 	} else {
 		k_work_schedule(&data->init_work,
