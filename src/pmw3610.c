@@ -69,15 +69,23 @@ struct pmw3610_data {
 	struct k_work_delayable flush_work;
 #endif
 	int async_init_step;
+	int init_retries;  /* per-step retry counter for async init */
 	bool ready;
 	bool is_resume;  /* first async init step sends WAKEUP, not RESET */
 	int err;
 	uint16_t cpi;
+	struct k_spinlock acc_lock;  /* guards dx_acc/dy_acc/acc_ts/last_rpt_time */
 	int32_t dx_acc;
 	int32_t dy_acc;
 	int64_t last_rpt_time;
 	int64_t acc_ts;  /* timestamp of last accumulation into dx/dy_acc */
 };
+
+/* Async init retry: a transient SPI hiccup at boot/resume must not leave the
+ * sensor permanently dead. Retry the failing step a bounded number of times
+ * before giving up. */
+#define PMW3610_INIT_MAX_RETRIES     5
+#define PMW3610_INIT_RETRY_DELAY_MS  50
 
 /* Accumulator is discarded if it's been sitting longer than this
  * without a new IRQ. Prevents minutes-old trapped deltas from being
@@ -365,10 +373,21 @@ static void pmw3610_async_init(struct k_work *work)
 
 	data->err = async_init_fn[data->async_init_step](dev);
 	if (data->err) {
-		LOG_ERR("Init failed at step %d", data->async_init_step);
+		if (data->init_retries < PMW3610_INIT_MAX_RETRIES) {
+			data->init_retries++;
+			LOG_WRN("Init step %d failed (%d), retry %d/%d",
+				data->async_init_step, data->err,
+				data->init_retries, PMW3610_INIT_MAX_RETRIES);
+			k_work_schedule(&data->init_work,
+					K_MSEC(PMW3610_INIT_RETRY_DELAY_MS));
+		} else {
+			LOG_ERR("Init failed permanently at step %d (%d)",
+				data->async_init_step, data->err);
+		}
 		return;
 	}
 
+	data->init_retries = 0;
 	data->async_init_step++;
 
 	if (data->async_init_step == ASYNC_INIT_STEP_COUNT) {
@@ -389,14 +408,20 @@ static void pmw3610_emit_accumulated(const struct device *dev)
 {
 	struct pmw3610_data *data = dev->data;
 
-	int16_t rx = (int16_t)CLAMP(data->dx_acc, INT16_MIN, INT16_MAX);
-	int16_t ry = (int16_t)CLAMP(data->dy_acc, INT16_MIN, INT16_MAX);
-
+	/* Snapshot and clear the accumulator atomically, then report outside
+	 * the lock (input_report must not run under a spinlock). */
+	k_spinlock_key_t key = k_spin_lock(&data->acc_lock);
+	int32_t dx = data->dx_acc;
+	int32_t dy = data->dy_acc;
 	data->dx_acc = 0;
 	data->dy_acc = 0;
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
 	data->last_rpt_time = k_uptime_get();
 #endif
+	k_spin_unlock(&data->acc_lock, key);
+
+	int16_t rx = (int16_t)CLAMP(dx, INT16_MIN, INT16_MAX);
+	int16_t ry = (int16_t)CLAMP(dy, INT16_MIN, INT16_MAX);
 
 	if (rx == 0 && ry == 0) return;
 
@@ -437,13 +462,16 @@ static void pmw3610_flush_work_cb(struct k_work *work)
 	 * pmw3610_emit_accumulated today. It's kept as defense-in-depth
 	 * so that if the upstream deadzone is ever weakened or removed,
 	 * flush_work can't wake the host on trivial sensor twitches. */
+	k_spinlock_key_t key = k_spin_lock(&data->acc_lock);
 	int32_t mag = (data->dx_acc < 0 ? -data->dx_acc : data->dx_acc)
 		    + (data->dy_acc < 0 ? -data->dy_acc : data->dy_acc);
 	if (mag < PMW3610_FLUSH_MIN_MAG) {
 		data->dx_acc = 0;
 		data->dy_acc = 0;
+		k_spin_unlock(&data->acc_lock, key);
 		return;
 	}
+	k_spin_unlock(&data->acc_lock, key);
 
 	pmw3610_emit_accumulated(data->dev);
 }
@@ -471,18 +499,22 @@ static int pmw3610_report_data(const struct device *dev)
 	int16_t y = sign_extend(((buf[PMW3610_XY_H_POS] & 0x0F) << 8) |
 				 buf[PMW3610_Y_L_POS], 11);
 
-	/* Raw-value deadzone: drop sub-pixel jitter before it enters
-	 * the accumulator. Without this, tiny spurious reports from
-	 * the sensor get summed up and eventually flushed as phantom
-	 * cursor movement, waking the host and keeping the radios hot. */
-	if (x >= -1 && x <= 1) x = 0;
-	if (y >= -1 && y <= 1) y = 0;
+	/* Only drop true no-motion reports. The old +/-1 raw deadzone was
+	 * dropping every single-count read, which kills slow ball creep: a
+	 * deliberate slow movement produces a stream of 1s that all got
+	 * zeroed, so the cursor sat dead until the ball "broke free" and
+	 * lurched — i.e. it manufactured stiction. Genuine slow motion is now
+	 * preserved; random sensor jitter is rejected downstream by the
+	 * accumulator's flush magnitude guard (PMW3610_FLUSH_MIN_MAG) and by
+	 * the speed-adaptive smoother on the central, and cancels in the
+	 * accumulator because it has no consistent direction. */
 	if (x == 0 && y == 0) return 0;
 
 	/* Staleness guard: if the accumulator has been sitting untouched
 	 * for longer than PMW3610_ACC_STALE_MS, discard it. Otherwise a
 	 * trapped delta from minutes ago could get prepended to fresh
 	 * motion, causing a visible cursor jump on the next movement. */
+	k_spinlock_key_t key = k_spin_lock(&data->acc_lock);
 	if (data->acc_ts != 0 && (now - data->acc_ts) > PMW3610_ACC_STALE_MS) {
 		data->dx_acc = 0;
 		data->dy_acc = 0;
@@ -494,7 +526,10 @@ static int pmw3610_report_data(const struct device *dev)
 
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
 	int64_t since = now - data->last_rpt_time;
+#endif
+	k_spin_unlock(&data->acc_lock, key);
 
+#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
 	if (since < CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
 		/* Throttled — schedule a delayed flush so accumulated
 		 * motion is always emitted within the window even if
@@ -558,6 +593,7 @@ static int pmw3610_pm_action(const struct device *dev,
 		 * WAKEUP command instead of a full RESET. */
 		data->is_resume = true;
 		data->async_init_step = 0;
+		data->init_retries = 0;
 		k_work_schedule(&data->init_work,
 				K_MSEC(async_init_delay[0]));
 		return 0;
